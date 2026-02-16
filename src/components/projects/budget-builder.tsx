@@ -1,8 +1,9 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { Dispatch, SetStateAction } from 'react';
 import { computeLineItemDirectCost, filterLineItems, summarizeBudget } from '@/lib/budget';
+import { supabase } from '@/lib/supabase';
 import type {
   BudgetFilters,
   CostType,
@@ -15,31 +16,128 @@ import { LineItemModal } from '@/components/projects/line-item-modal';
 
 interface BudgetBuilderProps {
   projectId: string;
-  markups: ProjectMarkups;
-  initialAreas?: ProjectReferenceRecord[];
-  initialScopes?: ProjectReferenceRecord[];
-  initialUnits?: ProjectReferenceRecord[];
-  initialItems?: LineItem[];
 }
 
 const usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' });
 
-export function BudgetBuilder({
-  projectId,
-  markups,
-  initialAreas = [],
-  initialScopes = [],
-  initialUnits = [],
-  initialItems = [],
-}: BudgetBuilderProps) {
-  const [areas, setAreas] = useState(initialAreas);
-  const [scopes, setScopes] = useState(initialScopes);
-  const [units, setUnits] = useState(initialUnits);
-  const [lineItems, setLineItems] = useState(initialItems);
+const defaultMarkups: ProjectMarkups = {
+  insurance: { mode: 'percent', value: 0 },
+  ohp: { mode: 'percent', value: 0 },
+  tax: { mode: 'percent', value: 0 },
+  contingency: { mode: 'percent', value: 0 },
+  escalation: { mode: 'percent', value: 0 },
+};
+
+const toNumber = (value: number | string | null | undefined): number => (value == null ? 0 : Number(value));
+
+export function BudgetBuilder({ projectId }: BudgetBuilderProps) {
+  const [areas, setAreas] = useState<ProjectReferenceRecord[]>([]);
+  const [scopes, setScopes] = useState<ProjectReferenceRecord[]>([]);
+  const [units, setUnits] = useState<ProjectReferenceRecord[]>([]);
+  const [lineItems, setLineItems] = useState<LineItem[]>([]);
+  const [markups, setMarkups] = useState<ProjectMarkups>(defaultMarkups);
   const [filters, setFilters] = useState<BudgetFilters>({ areaId: 'all', scopeId: 'all', costType: 'all' });
   const [applyMarkupsToFilteredView, setApplyMarkupsToFilteredView] = useState(false);
   const [editingItem, setEditingItem] = useState<LineItem | undefined>();
   const [modalOpen, setModalOpen] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const load = async () => {
+      setLoading(true);
+      setError(null);
+
+      const [projectResult, areasResult, scopesResult, unitsResult, itemsResult] = await Promise.all([
+        supabase
+          .from('projects')
+          .select(
+            'tax_mode,tax_value,ohp_mode,ohp_value,insurance_mode,insurance_value,contingency_mode,contingency_value,escalation_mode,escalation_value',
+          )
+          .eq('id', projectId)
+          .single(),
+        supabase.from('project_areas').select('id,project_id,name,sort_order').eq('project_id', projectId).order('sort_order'),
+        supabase.from('project_scopes').select('id,project_id,name,sort_order').eq('project_id', projectId).order('sort_order'),
+        supabase.from('project_units').select('id,project_id,name').eq('project_id', projectId).order('name'),
+        supabase
+          .from('line_items')
+          .select(
+            'id,project_id,area_id,scope_id,cost_type,description,vendor,material,qty,unit_id,unit_cost,hours,hourly_rate,sub_amount,notes',
+          )
+          .eq('project_id', projectId)
+          .order('created_at'),
+      ]);
+
+      const firstError =
+        projectResult.error ??
+        areasResult.error ??
+        scopesResult.error ??
+        unitsResult.error ??
+        itemsResult.error;
+
+      if (firstError) {
+        setError(firstError.message);
+        setLoading(false);
+        return;
+      }
+
+      const project = projectResult.data;
+      setMarkups({
+        tax: { mode: project.tax_mode, value: toNumber(project.tax_value) },
+        ohp: { mode: project.ohp_mode, value: toNumber(project.ohp_value) },
+        insurance: { mode: project.insurance_mode, value: toNumber(project.insurance_value) },
+        contingency: { mode: project.contingency_mode, value: toNumber(project.contingency_value) },
+        escalation: { mode: project.escalation_mode, value: toNumber(project.escalation_value) },
+      });
+
+      setAreas(
+        (areasResult.data ?? []).map((record) => ({
+          id: record.id,
+          projectId: record.project_id,
+          name: record.name,
+          sortOrder: record.sort_order,
+        })),
+      );
+      setScopes(
+        (scopesResult.data ?? []).map((record) => ({
+          id: record.id,
+          projectId: record.project_id,
+          name: record.name,
+          sortOrder: record.sort_order,
+        })),
+      );
+      setUnits(
+        (unitsResult.data ?? []).map((record) => ({
+          id: record.id,
+          projectId: record.project_id,
+          name: record.name,
+        })),
+      );
+      setLineItems(
+        (itemsResult.data ?? []).map((item) => ({
+          id: item.id,
+          projectId: item.project_id,
+          areaId: item.area_id,
+          scopeId: item.scope_id,
+          costType: item.cost_type,
+          description: item.description,
+          vendor: item.vendor ?? undefined,
+          material: item.material ?? undefined,
+          qty: toNumber(item.qty),
+          unitId: item.unit_id,
+          unitCost: toNumber(item.unit_cost),
+          hours: toNumber(item.hours),
+          hourlyRate: toNumber(item.hourly_rate),
+          subAmount: toNumber(item.sub_amount),
+          notes: item.notes ?? undefined,
+        })),
+      );
+
+      setLoading(false);
+    };
+
+    load();
+  }, [projectId]);
 
   const filteredItems = useMemo(() => filterLineItems(lineItems, filters), [lineItems, filters]);
 
@@ -48,13 +146,31 @@ export function BudgetBuilder({
     [lineItems, filteredItems, markups, applyMarkupsToFilteredView],
   );
 
-  const createReference = (
+  const createReference = async (
+    table: 'project_areas' | 'project_scopes' | 'project_units',
     listSetter: Dispatch<SetStateAction<ProjectReferenceRecord[]>>,
     name: string,
   ): Promise<ProjectReferenceRecord> => {
-    const newRecord = { id: crypto.randomUUID(), projectId, name };
+    const payload = table === 'project_units' ? { project_id: projectId, name } : { project_id: projectId, name, sort_order: 0 };
+
+    const { data, error: createError } = await supabase
+      .from(table)
+      .insert(payload)
+      .select('id,project_id,name,sort_order')
+      .single();
+
+    if (createError) {
+      throw new Error(createError.message);
+    }
+
+    const newRecord: ProjectReferenceRecord = {
+      id: data.id,
+      projectId: data.project_id,
+      name: data.name,
+      sortOrder: data.sort_order,
+    };
     listSetter((previous) => [...previous, newRecord]);
-    return Promise.resolve(newRecord);
+    return newRecord;
   };
 
   const openAddModal = () => {
@@ -62,12 +178,61 @@ export function BudgetBuilder({
     setModalOpen(true);
   };
 
+  const saveLineItem = async (saved: LineItem) => {
+    const payload = {
+      id: saved.id,
+      project_id: projectId,
+      area_id: saved.areaId ?? null,
+      scope_id: saved.scopeId ?? null,
+      cost_type: saved.costType,
+      description: saved.description,
+      vendor: saved.vendor ?? null,
+      material: saved.material ?? null,
+      qty: saved.qty ?? null,
+      unit_id: saved.unitId ?? null,
+      unit_cost: saved.unitCost ?? null,
+      hours: saved.hours ?? null,
+      hourly_rate: saved.hourlyRate ?? null,
+      sub_amount: saved.subAmount ?? null,
+      notes: saved.notes ?? null,
+    };
+
+    const { error: saveError } = await supabase.from('line_items').upsert(payload, { onConflict: 'id' });
+
+    if (saveError) {
+      setError(saveError.message);
+      return;
+    }
+
+    setLineItems((previous) => {
+      const exists = previous.some((item) => item.id === saved.id);
+      if (!exists) return [...previous, saved];
+      return previous.map((item) => (item.id === saved.id ? saved : item));
+    });
+    setModalOpen(false);
+  };
+
+  const deleteLineItem = async (id: string) => {
+    const { error: deleteError } = await supabase.from('line_items').delete().eq('id', id);
+    if (deleteError) {
+      setError(deleteError.message);
+      return;
+    }
+
+    setLineItems((previous) => previous.filter((item) => item.id !== id));
+  };
+
+  if (loading) {
+    return <div className="rounded-lg border border-slate-200 bg-white p-6 text-sm text-slate-600">Loading budget…</div>;
+  }
+
   return (
     <div className="grid grid-cols-1 gap-6 xl:grid-cols-[1fr_320px]">
       <section className="space-y-4">
         <div className="rounded-lg border border-slate-200 bg-white p-4">
           <h1 className="text-xl font-semibold text-slate-900">Budget Builder</h1>
           <p className="text-sm text-slate-600">Build direct costs by line item and apply project-level markups in summary.</p>
+          {error ? <p className="mt-2 text-sm text-red-600">{error}</p> : null}
         </div>
 
         <div className="grid grid-cols-1 gap-3 rounded-lg border border-slate-200 bg-white p-4 md:grid-cols-3">
@@ -77,7 +242,7 @@ export function BudgetBuilder({
             value={filters.areaId}
             options={areas}
             onChange={(next) => setFilters((previous) => ({ ...previous, areaId: next }))}
-            onCreate={(name) => createReference(setAreas, name)}
+            onCreate={(name) => createReference('project_areas', setAreas, name)}
           />
           <CreateOptionSelect
             label="Scopes"
@@ -85,7 +250,7 @@ export function BudgetBuilder({
             value={filters.scopeId}
             options={scopes}
             onChange={(next) => setFilters((previous) => ({ ...previous, scopeId: next }))}
-            onCreate={(name) => createReference(setScopes, name)}
+            onCreate={(name) => createReference('project_scopes', setScopes, name)}
           />
           <div className="space-y-1">
             <label className="text-sm font-medium text-slate-700">Cost Type</label>
@@ -138,16 +303,25 @@ export function BudgetBuilder({
                   <td className="px-4 py-3 capitalize">{item.costType}</td>
                   <td className="px-4 py-3 text-right font-medium">{usd.format(computeLineItemDirectCost(item))}</td>
                   <td className="px-4 py-3 text-right">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setEditingItem(item);
-                        setModalOpen(true);
-                      }}
-                      className="text-xs font-medium text-slate-700 underline"
-                    >
-                      Edit
-                    </button>
+                    <div className="flex justify-end gap-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEditingItem(item);
+                          setModalOpen(true);
+                        }}
+                        className="text-xs font-medium text-slate-700 underline"
+                      >
+                        Edit
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => deleteLineItem(item.id)}
+                        className="text-xs font-medium text-red-700 underline"
+                      >
+                        Delete
+                      </button>
+                    </div>
                   </td>
                 </tr>
               ))}
@@ -196,17 +370,10 @@ export function BudgetBuilder({
         units={units}
         initialValue={editingItem}
         onClose={() => setModalOpen(false)}
-        onSave={(saved) => {
-          setLineItems((previous) => {
-            const exists = previous.some((item) => item.id === saved.id);
-            if (!exists) return [...previous, saved];
-            return previous.map((item) => (item.id === saved.id ? saved : item));
-          });
-          setModalOpen(false);
-        }}
-        onCreateArea={(name) => createReference(setAreas, name)}
-        onCreateScope={(name) => createReference(setScopes, name)}
-        onCreateUnit={(name) => createReference(setUnits, name)}
+        onSave={saveLineItem}
+        onCreateArea={(name) => createReference('project_areas', setAreas, name)}
+        onCreateScope={(name) => createReference('project_scopes', setScopes, name)}
+        onCreateUnit={(name) => createReference('project_units', setUnits, name)}
       />
     </div>
   );
