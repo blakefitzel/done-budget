@@ -4,6 +4,7 @@ import type {
   LineItem,
   Markup,
   ProjectMarkups,
+  ProjectReferenceRecord,
 } from '@/types/budget';
 
 const toAmount = (value: number | undefined | null) => (value == null ? 0 : value);
@@ -66,4 +67,73 @@ export const summarizeBudget = (
     escalation,
     totalBudget,
   };
+};
+
+export interface AreaScopeGroup {
+  areaId: string;
+  areaName: string;
+  areaSubtotal: number;
+  scopes: {
+    scopeId: string;
+    scopeName: string;
+    scopeSubtotal: number;
+    items: LineItem[];
+  }[];
+}
+
+export const groupLineItemsByAreaAndScope = (
+  items: LineItem[],
+  areas: ProjectReferenceRecord[],
+  scopes: ProjectReferenceRecord[],
+): AreaScopeGroup[] => {
+  const areaLookup = new Map(areas.map((area) => [area.id, area.name]));
+  const scopeLookup = new Map(scopes.map((scope) => [scope.id, scope.name]));
+
+  const grouped = new Map<
+    string,
+    {
+      areaName: string;
+      areaSubtotal: number;
+      scopes: Map<string, { scopeName: string; scopeSubtotal: number; items: LineItem[] }>;
+    }
+  >();
+
+  for (const item of items) {
+    const areaId = item.areaId ?? 'unassigned-area';
+    const scopeId = item.scopeId ?? 'unassigned-scope';
+    const areaName = areaLookup.get(areaId) ?? 'Unassigned Area';
+    const scopeName = scopeLookup.get(scopeId) ?? 'Unassigned Scope';
+    const directCost = computeLineItemDirectCost(item);
+
+    if (!grouped.has(areaId)) {
+      grouped.set(areaId, {
+        areaName,
+        areaSubtotal: 0,
+        scopes: new Map(),
+      });
+    }
+
+    const areaGroup = grouped.get(areaId)!;
+    areaGroup.areaSubtotal += directCost;
+
+    if (!areaGroup.scopes.has(scopeId)) {
+      areaGroup.scopes.set(scopeId, { scopeName, scopeSubtotal: 0, items: [] });
+    }
+
+    const scopeGroup = areaGroup.scopes.get(scopeId)!;
+    scopeGroup.scopeSubtotal += directCost;
+    scopeGroup.items.push(item);
+  }
+
+  return Array.from(grouped.entries()).map(([areaId, area]) => ({
+    areaId,
+    areaName: area.areaName,
+    areaSubtotal: area.areaSubtotal,
+    scopes: Array.from(area.scopes.entries()).map(([scopeId, scope]) => ({
+      scopeId,
+      scopeName: scope.scopeName,
+      scopeSubtotal: scope.scopeSubtotal,
+      items: scope.items,
+    })),
+  }));
 };
