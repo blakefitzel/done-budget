@@ -1,9 +1,16 @@
 'use client';
 
+import Link from 'next/link';
 import { useEffect, useMemo, useState } from 'react';
 import type { Dispatch, SetStateAction } from 'react';
-import { computeLineItemDirectCost, filterLineItems, summarizeBudget } from '@/lib/budget';
+import {
+  computeLineItemDirectCost,
+  filterLineItems,
+  groupLineItemsByAreaAndScope,
+  summarizeBudget,
+} from '@/lib/budget';
 import { supabase } from '@/lib/supabase';
+import { createBudgetWorkbook } from '@/lib/xlsx';
 import type {
   BudgetFilters,
   CostType,
@@ -31,6 +38,8 @@ const defaultMarkups: ProjectMarkups = {
 const toNumber = (value: number | string | null | undefined): number => (value == null ? 0 : Number(value));
 
 export function BudgetBuilder({ projectId }: BudgetBuilderProps) {
+  const [projectName, setProjectName] = useState('Project Budget');
+  const [projectLocation, setProjectLocation] = useState<string | null>(null);
   const [areas, setAreas] = useState<ProjectReferenceRecord[]>([]);
   const [scopes, setScopes] = useState<ProjectReferenceRecord[]>([]);
   const [units, setUnits] = useState<ProjectReferenceRecord[]>([]);
@@ -38,6 +47,7 @@ export function BudgetBuilder({ projectId }: BudgetBuilderProps) {
   const [markups, setMarkups] = useState<ProjectMarkups>(defaultMarkups);
   const [filters, setFilters] = useState<BudgetFilters>({ areaId: 'all', scopeId: 'all', costType: 'all' });
   const [applyMarkupsToFilteredView, setApplyMarkupsToFilteredView] = useState(false);
+  const [hideUnitPricing, setHideUnitPricing] = useState(false);
   const [editingItem, setEditingItem] = useState<LineItem | undefined>();
   const [modalOpen, setModalOpen] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -52,7 +62,7 @@ export function BudgetBuilder({ projectId }: BudgetBuilderProps) {
         supabase
           .from('projects')
           .select(
-            'tax_mode,tax_value,ohp_mode,ohp_value,insurance_mode,insurance_value,contingency_mode,contingency_value,escalation_mode,escalation_value',
+            'name,location,tax_mode,tax_value,ohp_mode,ohp_value,insurance_mode,insurance_value,contingency_mode,contingency_value,escalation_mode,escalation_value',
           )
           .eq('id', projectId)
           .single(),
@@ -82,6 +92,8 @@ export function BudgetBuilder({ projectId }: BudgetBuilderProps) {
       }
 
       const project = projectResult.data;
+      setProjectName(project.name);
+      setProjectLocation(project.location ?? null);
       setMarkups({
         tax: { mode: project.tax_mode, value: toNumber(project.tax_value) },
         ohp: { mode: project.ohp_mode, value: toNumber(project.ohp_value) },
@@ -145,6 +157,15 @@ export function BudgetBuilder({ projectId }: BudgetBuilderProps) {
     () => summarizeBudget(lineItems, filteredItems, markups, applyMarkupsToFilteredView),
     [lineItems, filteredItems, markups, applyMarkupsToFilteredView],
   );
+
+  const groupedBreakdown = useMemo(
+    () => groupLineItemsByAreaAndScope(filteredItems, areas, scopes),
+    [filteredItems, areas, scopes],
+  );
+
+  const areaNameById = useMemo(() => new Map(areas.map((area) => [area.id, area.name])), [areas]);
+  const scopeNameById = useMemo(() => new Map(scopes.map((scope) => [scope.id, scope.name])), [scopes]);
+  const unitNameById = useMemo(() => new Map(units.map((unit) => [unit.id, unit.name])), [units]);
 
   const createReference = async (
     table: 'project_areas' | 'project_scopes' | 'project_units',
@@ -222,6 +243,83 @@ export function BudgetBuilder({ projectId }: BudgetBuilderProps) {
     setLineItems((previous) => previous.filter((item) => item.id !== id));
   };
 
+  const exportWorkbook = () => {
+    const lineItemRows: ({ type: 'inlineStr' | 'n'; value: string | number; styleIndex?: number }[])[] = [
+      [
+        { type: 'inlineStr', value: 'Description', styleIndex: 1 },
+        { type: 'inlineStr', value: 'Area', styleIndex: 1 },
+        { type: 'inlineStr', value: 'Scope', styleIndex: 1 },
+        { type: 'inlineStr', value: 'Cost Type', styleIndex: 1 },
+        ...(hideUnitPricing ? [] : [{ type: 'inlineStr' as const, value: 'Unit Detail', styleIndex: 1 }]),
+        { type: 'inlineStr', value: 'Direct Cost', styleIndex: 1 },
+      ],
+    ];
+
+    groupedBreakdown.forEach((areaGroup) => {
+      lineItemRows.push([
+        { type: 'inlineStr', value: `Area: ${areaGroup.areaName}`, styleIndex: 1 },
+        { type: 'inlineStr', value: '' },
+        { type: 'inlineStr', value: '' },
+        { type: 'inlineStr', value: '' },
+        ...(hideUnitPricing ? [] : [{ type: 'inlineStr' as const, value: '' }]),
+        { type: 'n', value: areaGroup.areaSubtotal, styleIndex: 3 },
+      ]);
+
+      areaGroup.scopes.forEach((scopeGroup) => {
+        lineItemRows.push([
+          { type: 'inlineStr', value: `  Scope: ${scopeGroup.scopeName}`, styleIndex: 1 },
+          { type: 'inlineStr', value: '' },
+          { type: 'inlineStr', value: '' },
+          { type: 'inlineStr', value: '' },
+          ...(hideUnitPricing ? [] : [{ type: 'inlineStr' as const, value: '' }]),
+          { type: 'n', value: scopeGroup.scopeSubtotal, styleIndex: 2 },
+        ]);
+
+        scopeGroup.items.forEach((item) => {
+          const unitDetails =
+            item.costType === 'labor'
+              ? `${item.hours ?? 0}h × ${usd.format(item.hourlyRate ?? 0)}`
+              : item.costType === 'material'
+                ? `${item.qty ?? 0} × ${unitNameById.get(item.unitId ?? '') ?? 'unit'} × ${usd.format(item.unitCost ?? 0)}`
+                : `Allowance: ${usd.format(item.subAmount ?? 0)}`;
+
+          lineItemRows.push([
+            { type: 'inlineStr', value: item.description },
+            { type: 'inlineStr', value: areaNameById.get(item.areaId ?? '') ?? 'Unassigned Area' },
+            { type: 'inlineStr', value: scopeNameById.get(item.scopeId ?? '') ?? 'Unassigned Scope' },
+            { type: 'inlineStr', value: item.costType },
+            ...(hideUnitPricing ? [] : [{ type: 'inlineStr' as const, value: unitDetails }]),
+            { type: 'n', value: computeLineItemDirectCost(item), styleIndex: 2 },
+          ]);
+        });
+      });
+    });
+
+    const summaryRows: ({ type: 'inlineStr' | 'n'; value: string | number; styleIndex?: number }[])[] = [
+      [
+        { type: 'inlineStr', value: 'Summary Item', styleIndex: 1 },
+        { type: 'inlineStr', value: 'Amount', styleIndex: 1 },
+      ],
+      [{ type: 'inlineStr', value: 'Direct Subtotal' }, { type: 'n', value: summary.directSubtotal, styleIndex: 2 }],
+      [{ type: 'inlineStr', value: 'Insurance' }, { type: 'n', value: summary.insurance, styleIndex: 2 }],
+      [{ type: 'inlineStr', value: 'OH&P' }, { type: 'n', value: summary.ohp, styleIndex: 2 }],
+      [{ type: 'inlineStr', value: 'Tax' }, { type: 'n', value: summary.tax, styleIndex: 2 }],
+      [{ type: 'inlineStr', value: 'Contingency' }, { type: 'n', value: summary.contingency, styleIndex: 2 }],
+      [{ type: 'inlineStr', value: 'Escalation' }, { type: 'n', value: summary.escalation, styleIndex: 2 }],
+      [{ type: 'inlineStr', value: 'Grand Total', styleIndex: 1 }, { type: 'n', value: summary.totalBudget, styleIndex: 3 }],
+    ];
+
+    const blob = createBudgetWorkbook(lineItemRows, summaryRows);
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `${projectName.toLowerCase().replaceAll(/\s+/g, '-') || 'budget'}-export.xlsx`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const printHref = `/projects/${projectId}/budget/print?areaId=${filters.areaId}&scopeId=${filters.scopeId}&costType=${filters.costType}&hideUnitPricing=${hideUnitPricing}&applyMarkupsToFilteredView=${applyMarkupsToFilteredView}`;
+
   if (loading) {
     return <div className="rounded-lg border border-slate-200 bg-white p-6 text-sm text-slate-600">Loading budget…</div>;
   }
@@ -232,6 +330,7 @@ export function BudgetBuilder({ projectId }: BudgetBuilderProps) {
         <div className="rounded-lg border border-slate-200 bg-white p-4">
           <h1 className="text-xl font-semibold text-slate-900">Budget Builder</h1>
           <p className="text-sm text-slate-600">Build direct costs by line item and apply project-level markups in summary.</p>
+          <p className="text-xs text-slate-500">{projectName}{projectLocation ? ` · ${projectLocation}` : ''}</p>
           {error ? <p className="mt-2 text-sm text-red-600">{error}</p> : null}
         </div>
 
@@ -264,6 +363,21 @@ export function BudgetBuilder({ projectId }: BudgetBuilderProps) {
               <option value="material">Material</option>
               <option value="sub">Subcontractor</option>
             </select>
+          </div>
+        </div>
+
+        <div className="rounded-lg border border-slate-200 bg-white p-4">
+          <div className="flex flex-wrap items-center gap-3">
+            <label className="flex items-center gap-2 text-sm text-slate-700">
+              <input type="checkbox" checked={hideUnitPricing} onChange={(event) => setHideUnitPricing(event.target.checked)} />
+              Hide unit pricing (client-facing export)
+            </label>
+            <button onClick={exportWorkbook} className="rounded bg-slate-900 px-3 py-2 text-sm text-white" type="button">
+              Export XLSX
+            </button>
+            <Link href={printHref} target="_blank" className="rounded border border-slate-300 px-3 py-2 text-sm text-slate-700">
+              Open print view
+            </Link>
           </div>
         </div>
 
@@ -358,6 +472,28 @@ export function BudgetBuilder({ projectId }: BudgetBuilderProps) {
             <SummaryRow label="Escalation" value={summary.escalation} />
             <SummaryRow label="Total Budget" value={summary.totalBudget} bold />
           </dl>
+        </div>
+
+        <div className="rounded-lg border border-slate-200 bg-white p-4">
+          <h2 className="mb-3 font-semibold text-slate-900">Area / Scope Breakdown</h2>
+          <div className="space-y-2 text-sm">
+            {groupedBreakdown.map((areaGroup) => (
+              <div key={areaGroup.areaId}>
+                <div className="flex items-center justify-between font-medium text-slate-800">
+                  <span>{areaGroup.areaName}</span>
+                  <span>{usd.format(areaGroup.areaSubtotal)}</span>
+                </div>
+                <div className="mt-1 space-y-1 pl-3">
+                  {areaGroup.scopes.map((scopeGroup) => (
+                    <div key={`${areaGroup.areaId}-${scopeGroup.scopeId}`} className="flex items-center justify-between text-slate-600">
+                      <span>{scopeGroup.scopeName}</span>
+                      <span>{usd.format(scopeGroup.scopeSubtotal)}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
       </aside>
 
