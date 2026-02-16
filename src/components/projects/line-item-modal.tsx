@@ -13,7 +13,7 @@ interface LineItemModalProps {
   units: ProjectReferenceRecord[];
   initialValue?: LineItem;
   onClose: () => void;
-  onSave: (lineItem: LineItem) => void;
+  onSave: (lineItem: LineItem) => Promise<void> | void;
   onCreateArea: (name: string) => Promise<ProjectReferenceRecord>;
   onCreateScope: (name: string) => Promise<ProjectReferenceRecord>;
   onCreateUnit: (name: string) => Promise<ProjectReferenceRecord>;
@@ -41,6 +41,7 @@ export function LineItemModal({
   onCreateUnit,
 }: LineItemModalProps) {
   const [draft, setDraft] = useState<LineItem>(emptyLineItem(projectId));
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -197,15 +198,20 @@ export function LineItemModal({
         </div>
 
         <div className="mt-6 flex justify-end gap-2">
-          <button type="button" onClick={onClose} className="rounded border border-slate-300 px-3 py-2 text-sm">
+          <button type="button" onClick={onClose} className="rounded border border-slate-300 px-3 py-2 text-sm" disabled={saving}>
             Cancel
           </button>
           <button
             type="button"
-            onClick={() => onSave(draft)}
+            onClick={async () => {
+              setSaving(true);
+              await onSave(draft);
+              setSaving(false);
+            }}
             className="rounded bg-slate-900 px-4 py-2 text-sm text-white"
+            disabled={saving}
           >
-            Save Line Item
+            {saving ? 'Saving...' : 'Save Line Item'}
           </button>
         </div>
       </div>
